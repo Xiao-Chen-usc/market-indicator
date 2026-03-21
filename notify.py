@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-CC's Market Indicator - Monthly Buffer Strategy
-notify_monthly.py
+CC's Market Indicator - Monthly CR_reset Strategy
+notify_monthly_v2.py
 
-月度Buffer策略：
+月度CR_reset策略：
   Score = 0.5 * log_z(BI, 180月) + 0.5 * z(CE_12月, 180月)
-  触发：pos_area > buffer  → 1/3仓
-  解除：连续4个月Score < 0 → 满仓
+  CR = Σ max(Score, 0)，Score≤0时清零
+  触发：CR > 阈值 → 1/3仓
+  解除：Score≤0（CR清零）→ 满仓
 
-GitHub Actions每月1日自动运行，发送邮件报告
+比Buffer策略更敏感：不积累保护期，Score变负立刻清零重来
 
-环境变量：
-  FRED_API_KEY   - FRED API密钥
-  GMAIL_USER     - Gmail发件人
-  GMAIL_APP_PASS - Gmail App Password
-  NOTIFY_EMAIL   - 收件人邮箱
+GitHub Actions每月1日自动运行
 """
 
 import os, json, urllib.request, datetime, smtplib, io
@@ -29,7 +26,6 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.ticker as ticker
 
-# ── 配置 ─────────────────────────────────────────────────
 FRED_KEY     = os.environ.get("FRED_API_KEY","")
 GMAIL_USER   = os.environ.get("GMAIL_USER","")
 GMAIL_PASS   = os.environ.get("GMAIL_APP_PASS","")
@@ -38,14 +34,13 @@ FRED_BASE    = "https://api.stlouisfed.org/fred/series/observations"
 START        = "1970-01-01"
 
 # 策略参数
-CE_W    = 12    # CE平滑窗口（月）
-Z_W     = 180   # z-score窗口（月=15年）
-CONFIRM = 4     # 解除确认期（月）
-POS_A   = 1/3   # 报警时仓位
-CASH_R  = 1.0   # 现金年化收益%
-START_BT= "1985-01"
+CE_W      = 12     # CE平滑窗口（月）
+Z_W       = 180    # z-score窗口（月=15年）
+CR_THRESH = 9.0    # CR触发阈值（月度版，年度版3.0×3月=9.0）
+POS_A     = 1/3    # 报警时仓位
+CASH_R    = 1.0    # 现金年化收益%
+START_BT  = "1985-01"
 
-# ── 数据获取 ─────────────────────────────────────────────
 def fetch_q(sid):
     url=(f"{FRED_BASE}?series_id={sid}&api_key={FRED_KEY}"
          f"&file_type=json&frequency=q&observation_start={START}")
@@ -66,11 +61,9 @@ def fetch_sp500_monthly():
         out[f"{dt.year}-{dt.month:02d}"]=float(row['Close'])
     return out
 
-# ── 时间序列工具 ─────────────────────────────────────────
 def gen_months(sy=1970,ey=None):
     if ey is None:
-        t=datetime.date.today()
-        ey=t.year+1
+        t=datetime.date.today(); ey=t.year+1
     return [f"{y}-{m:02d}" for y in range(sy,ey+1) for m in range(1,13)]
 
 def prev_q(q):
@@ -81,8 +74,7 @@ def q_to_monthly(q_dict,months):
     out={}
     for ym in months:
         y,m=int(ym[:4]),int(ym[5:7])
-        q=f"{y}Q{(m-1)//3+1}"
-        pq=prev_q(q)
+        q=f"{y}Q{(m-1)//3+1}"; pq=prev_q(q)
         v=q_dict.get(q); vp=q_dict.get(pq)
         if v is None: continue
         pos=(m-1)%3
@@ -118,41 +110,18 @@ def rolling_z(s,w):
 def rolling_log_z(s,w):
     return rolling_z([np.log(v) if v and v>0 else None for v in s],w)
 
-# ── Buffer CR（月度，N月确认解除）────────────────────────
-def buffer_cr(score_list,confirm_n=4):
-    sig=[]; buf_l=[]; pos_l=[]; st_l=[]
-    buffer=0.0; pos_area=0.0; neg_area=0.0
-    in_pos=False; alert=False; neg_streak=0
+def cr_reset(score_list):
+    """Score>0累加，Score≤0清零"""
+    cr=[]; bucket=0.0
     for v in score_list:
-        if not sv(v):
-            sig.append(None); buf_l.append(buffer)
-            pos_l.append(pos_area); st_l.append('none')
-            continue
-        if v>=0:
-            neg_streak=0
-            if not in_pos: in_pos=True
-            pos_area+=v
-            eff=max(0.0,pos_area-buffer)
-            if eff>0: alert=True
-        else:
-            neg_streak+=1
-            neg_area+=abs(v); buffer=neg_area
-            if alert:
-                if neg_streak>=confirm_n:
-                    alert=False; in_pos=False; pos_area=0.0
-                eff=max(0.0,pos_area-buffer) if alert else 0.0
-            else:
-                if in_pos: pos_area=0.0; in_pos=False
-                eff=0.0
-        sig.append(eff if alert else 0.0)
-        buf_l.append(buffer); pos_l.append(pos_area)
-        st_l.append('alert' if alert else 'full')
-    return sig,buf_l,pos_l,st_l
+        if not sv(v): cr.append(None); continue
+        bucket=0.0 if v<=0 else bucket+v
+        cr.append(bucket)
+    return cr
 
-# ── 主流程 ───────────────────────────────────────────────
 def main():
     today=datetime.date.today()
-    print(f"[{today}] CC Market Indicator - Monthly Buffer")
+    print(f"[{today}] CC Market Indicator - Monthly CR_reset")
 
     print("Fetching FRED data...")
     mcap_q    = fetch_q("NCBEILQ027S")
@@ -160,16 +129,15 @@ def main():
     gdp_real_q= fetch_q("GDPC1")
     tcmdo_q   = fetch_q("TCMDO")
 
-    print("Fetching SP500 (yfinance)...")
+    print("Fetching SP500...")
     sp500_m   = fetch_sp500_monthly()
 
     months = gen_months(1970, today.year+1)
 
-    # BI月度
-    mcap_m = q_to_monthly(mcap_q,  months)
+    mcap_m = q_to_monthly(mcap_q,   months)
     gdp_m  = q_to_monthly(gdp_nom_q,months)
     gdpr_m = q_to_monthly(gdp_real_q,months)
-    tcmdo_m= q_to_monthly(tcmdo_q, months)
+    tcmdo_m= q_to_monthly(tcmdo_q,  months)
 
     bi_m=[mcap_m[ym]/1000/gdp_m[ym]*100
           if gdp_m.get(ym) and gdp_m[ym]>0 and mcap_m.get(ym) else None
@@ -179,7 +147,6 @@ def main():
               if yoy_m(tcmdo_m,ym) is not None and yoy_m(gdpr_m,ym) is not None
               else None for ym in months]
 
-    # SP500月度收益
     sp_ret=[None]*len(months)
     for i,ym in enumerate(months):
         if sp500_m.get(ym) and i>0:
@@ -187,7 +154,6 @@ def main():
             if sp500_m.get(pm) and sp500_m[pm]>0:
                 sp_ret[i]=(sp500_m[ym]-sp500_m[pm])/sp500_m[pm]*100
 
-    # Score
     ce_s   = roll_mean(ce_m_raw,CE_W)
     z_bi   = rolling_log_z(bi_m,Z_W)
     z_ce   = rolling_z(ce_s,Z_W)
@@ -195,82 +161,112 @@ def main():
               if sv(z_bi[i]) and sv(z_ce[i]) else None
               for i in range(len(months))]
 
-    # Buffer CR
-    sig,buf_l,pos_l,st_l = buffer_cr(score,CONFIRM)
+    cr_m   = cr_reset(score)
 
     # 当前状态
     latest_i=max((i for i,ym in enumerate(months) if sv(score[i])),default=0)
     latest_m=months[latest_i]
     sc_now  =score[latest_i]
-    buf_now =buf_l[latest_i]
-    pos_now =pos_l[latest_i]
-    eff_now =sig[latest_i]
-    st_now  =st_l[latest_i]
+    cr_now  =cr_m[latest_i] if sv(cr_m[latest_i]) else 0.0
     bi_now  =bi_m[latest_i]
     zbi_now =z_bi[latest_i]
     zce_now =z_ce[latest_i]
+    in_alert= sv(cr_now) and cr_now>CR_THRESH
 
-    gap     = buf_now - pos_now
-    in_alert= sv(eff_now) and eff_now>0
-    pos_pct = POS_A*100 if in_alert else 100
+    # 距离触发还差多少
+    gap_to_trigger=max(0.0, CR_THRESH-cr_now) if not in_alert else 0.0
+    valid_sc=[v for v in score if sv(v)]
+    avg_sc_pos=np.mean([v for v in valid_sc[-24:] if v>0]) if valid_sc else 1.0
+    mo_to_trigger=int(np.ceil(gap_to_trigger/avg_sc_pos)) if avg_sc_pos>0 and gap_to_trigger>0 else 0
 
-    # 需要多少个月触发（估算）：只用有效Score的最后24个月
-    valid_scores=[v for v in score if sv(v)]
-    avg_score=np.mean(valid_scores[-24:]) if valid_scores else 0
-    if avg_score>0 and gap>0:
-        months_to_trigger=int(np.ceil(gap/avg_score))
-    else:
-        months_to_trigger=0
-
-    # 状态字符串
     if in_alert:
-        status_icon="⚠️"
-        status_text=f"ALERT — 持有 1/3 股票 + 2/3 SGOV"
-    elif st_now=='alert':
-        # 确认期
-        status_icon="🟡"
-        status_text=f"确认期 — 仍持 1/3 仓，等待连续{CONFIRM}月Score<0"
+        status_icon="⚠️"; status_text="ALERT — 持有 1/3 股票 + 2/3 SGOV"
     else:
-        status_icon="✅"
-        status_text=f"CLEAR — 持有 100% 股票（VTI/SPY）"
+        status_icon="✅"; status_text="CLEAR — 持有 100% 股票（VTI/SPY）"
 
-    print(f"\n当前状态：{status_icon} {status_text}")
-    print(f"  月份     = {latest_m}")
-    print(f"  BI       = {bi_now:.1f}%" if bi_now else "  BI = n/a")
-    print(f"  Score    = {sc_now:.2f}" if sv(sc_now) else "  Score = n/a")
-    print(f"  buffer   = {buf_now:.2f}")
-    print(f"  pos_area = {pos_now:.2f}")
-    print(f"  gap      = {gap:.2f}（还差{months_to_trigger}个月触发）")
+    print(f"\n{status_icon} {status_text}")
+    print(f"  月份    = {latest_m}")
+    print(f"  Score   = {sc_now:.2f}")
+    print(f"  CR      = {cr_now:.2f}  (阈值={CR_THRESH})")
+    print(f"  距触发  = {gap_to_trigger:.2f}  ≈{mo_to_trigger}个月")
 
-    # ── 触发历史 ──────────────────────────────────────────
+    # 扫描月度阈值（打印供参考）
+    print(f"\n月度CR阈值扫描：")
+    CASH_M=CASH_R/12
+    ret24=[None]*len(months)
+    for i,ym in enumerate(months):
+        if sp500_m.get(ym) and i+24<len(months):
+            fm=months[i+24]
+            if sp500_m.get(fm) and sp500_m[ym]>0:
+                ret24[i]=((sp500_m[fm]/sp500_m[ym])**0.5-1)*100
+    bh2=np.mean([r for r in ret24 if r is not None])
+    bh_ref=None; best_th=CR_THRESH; best_c=-999
+    print(f"{'阈值':>6} {'CAGR':>8} {'超额':>8} {'Sharpe':>8} {'MaxDD':>7} {'触发月份'}")
+    print("-"*75)
+    for th in [6,9,12,15,18,24,30,36]:
+        port=100.0; bh=100.0; half=0; rets_=[]; prev=False; trigs=[]
+        for i,ym in enumerate(months):
+            if ym<START_BT: continue
+            cr=cr_m[i]; ret=sp_ret[i]
+            if ret is None: continue
+            pos=POS_A if (sv(cr) and cr>th) else 1.0
+            if pos<1.0:
+                half+=1
+                if not prev: trigs.append(ym)
+            prev=(pos<1.0)
+            port*=(1+(pos*ret+(1-pos)*CASH_M)/100)
+            bh  *=(1+ret/100)
+            rets_.append(pos*ret+(1-pos)*CASH_M)
+        n_yr=len([ym for ym in months if ym>=START_BT
+                  and sp_ret[months.index(ym)] is not None])/12
+        c=(port/100)**(1/n_yr)-1
+        if bh_ref is None: bh_ref=(bh/100)**(1/n_yr)-1
+        sh=(np.mean(rets_)-CASH_M)/np.std(rets_)
+        vals=[]; p2=100.0
+        for i,ym in enumerate(months):
+            if ym<START_BT: continue
+            cr=cr_m[i]; ret=sp_ret[i]
+            if ret is None: continue
+            pos=POS_A if (sv(cr) and cr>th) else 1.0
+            p2*=(1+(pos*ret+(1-pos)*CASH_M)/100); vals.append(p2)
+        pk=vals[0]; dd=0
+        for x in vals: pk=max(pk,x); dd=max(dd,(pk-x)/pk*100)
+        if c>best_c: best_c=c; best_th=th
+        trigs_s=' '.join(trigs[:3])+('...' if len(trigs)>3 else '')
+        print(f"  >{th:>3}  {c*100:>7.2f}%  {(c-bh_ref)*100:>+7.2f}%  "
+              f"{sh:>7.3f}  {-dd:>6.1f}%  {trigs_s}")
+    print(f"  B&H: CAGR={bh_ref*100:.2f}%  最优阈值={best_th}")
+
+    # 触发历史
     triggers=[]
-    prev2=False
+    prev=False
     for i,ym in enumerate(months):
         if ym<START_BT: continue
-        s=sig[i]
-        if not sv(s): prev2=False; continue
-        if s>0:
-            if not prev2:
-                triggers.append(('触发',ym,buf_l[i],pos_l[i]))
-            prev2=True
-        elif prev2:
-            triggers.append(('解除',ym,buf_l[i],pos_l[i]))
-            prev2=False
+        cr=cr_m[i]
+        if not sv(cr): prev=False; continue
+        if cr>CR_THRESH:
+            if not prev: triggers.append(('触发',ym,cr_now))
+            prev=True
+        elif prev:
+            triggers.append(('解除',ym,cr_m[i]))
+            prev=False
+    if prev: triggers.append(('报警中',latest_m,cr_now))
+
+    trigger_lines="\n".join(
+        f"  {t[0]} {t[1]}: CR={t[2]:.1f}" for t in triggers
+    ) or "  （无触发记录）"
 
     # ── 画图 ──────────────────────────────────────────────
     nan=float('nan')
-    sc_p =[x if sv(x) else nan for x in score]
-    eff_p=[x if sv(x) else nan for x in sig]
-    buf_p=[x if sv(x) else nan for x in buf_l]
-    pa_p =[x if sv(x) else nan for x in pos_l]
-    sp_p =[sp500_m.get(ym,nan) for ym in months]
+    sc_p=[x if sv(x) else nan for x in score]
+    cr_p=[x if sv(x) else nan for x in cr_m]
+    sp_p=[sp500_m.get(ym,nan) for ym in months]
 
     BG='#0e1117'; BLUE='#00d4ff'; YEL='#ffe066'
     GRN='#4ecdc4'; RED='#ff6b6b'; ORG='#ffa500'
 
     fig=plt.figure(figsize=(14,14),facecolor=BG)
     gs=gridspec.GridSpec(3,1,figure=fig,hspace=0.10,height_ratios=[1.4,1,1])
-
     def mka(pos):
         ax=fig.add_subplot(pos); ax.set_facecolor(BG)
         ax.tick_params(colors='white',labelsize=8)
@@ -281,36 +277,30 @@ def main():
         return ax
 
     ax1=mka(gs[0]); ax2=mka(gs[1]); ax3=mka(gs[2])
-
-    yt=[i for i,ym in enumerate(months)
-        if ym.endswith('-01') and int(ym[:4])%5==0]
-    yl=[ym[:4] for i,ym in enumerate(months)
-        if ym.endswith('-01') and int(ym[:4])%5==0]
+    yt=[i for i,ym in enumerate(months) if ym.endswith('-01') and int(ym[:4])%5==0]
+    yl=[ym[:4] for i,ym in enumerate(months) if ym.endswith('-01') and int(ym[:4])%5==0]
     xi=list(range(len(months)))
 
-    title_color=RED if in_alert else (ORG if st_now=='alert' else GRN)
+    tc=RED if in_alert else GRN
     fig.suptitle(
-        f"CC Market Indicator  |  Monthly Buffer  |  {latest_m}\n"
+        f"CC Market Indicator  |  Monthly CR_reset  |  {latest_m}\n"
         f"{status_icon} {status_text}\n"
-        f"Score={sc_now:.2f}  buffer={buf_now:.1f}  pos={pos_now:.1f}  "
-        f"gap={gap:.1f}  est.trigger~{months_to_trigger}mo",
-        fontsize=10,color=title_color,fontweight='bold',y=0.99)
+        f"Score={sc_now:.2f}  CR={cr_now:.1f}  threshold={CR_THRESH}  "
+        f"gap={gap_to_trigger:.1f}  est.trigger~{mo_to_trigger}mo",
+        fontsize=10,color=tc,fontweight='bold',y=0.99)
 
     # P1: S&P500
     ax1.semilogy(xi,sp_p,color=BLUE,lw=1.0,zorder=5)
     ax1.fill_between(xi,sp_p,50,alpha=0.06,color=BLUE)
     for i in range(len(months)):
-        e=eff_p[i]; v=score[i]; st=st_l[i]
-        if not np.isnan(e) and e>0:
+        cr=cr_p[i]
+        if not np.isnan(cr) and cr>CR_THRESH:
             ax1.axvspan(i-0.5,i+0.5,alpha=0.22,color=RED,zorder=1)
-        elif sv(v) and v<0 and st=='alert':
-            ax1.axvspan(i-0.5,i+0.5,alpha=0.18,color=ORG,zorder=1)
-    # 触发/解除标注
     prev=False
     for i,ym in enumerate(months):
-        e=eff_p[i]
-        if np.isnan(e): prev=False; continue
-        if e>0:
+        cr=cr_p[i]
+        if np.isnan(cr): prev=False; continue
+        if cr>CR_THRESH:
             if not prev and sp500_m.get(ym):
                 ax1.scatter(i,sp500_m[ym],color=RED,s=60,zorder=7,marker='v')
                 ax1.annotate(ym,xy=(i,sp500_m[ym]),
@@ -320,79 +310,82 @@ def main():
             prev=True
         else: prev=False
     ax1.scatter(latest_i,sp500_m.get(latest_m,nan),
-                color=title_color,s=200,zorder=9,marker='*')
+                color=tc,s=200,zorder=9,marker='*')
     ax1.set_ylabel('S&P 500 (log)',color='white',fontsize=9)
     ax1.set_ylim(50,10000); ax1.set_xticks(yt); ax1.set_xticklabels([])
-    ax1.yaxis.set_major_formatter(
-        ticker.FuncFormatter(lambda x,p:f'{int(x):,}'))
+    ax1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x,p:f'{int(x):,}'))
     from matplotlib.patches import Patch
     ax1.legend(handles=[
-        Patch(facecolor=RED,alpha=0.4,label='1/3 position (alert)'),
-        Patch(facecolor=ORG,alpha=0.4,label=f'Confirm period ({CONFIRM}mo)'),
+        Patch(facecolor=RED,alpha=0.4,label=f'1/3 position (CR>{CR_THRESH})'),
         plt.Line2D([0],[0],color=BLUE,lw=2,label='S&P 500')],
         fontsize=8.5,facecolor='#1a1d27',labelcolor='white',loc='upper left')
 
     # P2: Score月度
-    ax2.plot(xi,sc_p,color=YEL,lw=0.9,zorder=4)
+    ax2.plot(xi,sc_p,color=YEL,lw=0.9,zorder=4,label='Monthly Score')
     ax2.fill_between(xi,sc_p,0,where=[not np.isnan(z) and z>0 for z in sc_p],
-        alpha=0.20,color=RED,zorder=3,label='Positive (accumulates)')
+        alpha=0.20,color=RED,zorder=3,label='Positive (accumulates CR)')
     ax2.fill_between(xi,sc_p,0,where=[not np.isnan(z) and z<0 for z in sc_p],
-        alpha=0.20,color=GRN,zorder=3,label='Negative (builds buffer)')
-    for i in range(len(months)):
-        v=score[i]; st=st_l[i]
-        if sv(v) and v<0 and st=='alert':
-            ax2.axvspan(i-0.5,i+0.5,alpha=0.18,color=ORG,zorder=2)
+        alpha=0.20,color=GRN,zorder=3,label='Negative (CR resets to 0)')
     ax2.axhline(0,color='white',lw=1,ls='--',alpha=0.5)
     ax2.scatter(latest_i,sc_now if sv(sc_now) else 0,
-                color=title_color,s=150,zorder=8,marker='*')
+                color=tc,s=150,zorder=8,marker='*')
     ax2.text(latest_i+8,sc_now if sv(sc_now) else 0,
-             f'{latest_m}\nScore={sc_now:.2f}' if sv(sc_now) else '',
-             fontsize=8,color=title_color,va='center',
-             bbox=dict(boxstyle='round',facecolor='#1a1d27',
-                       edgecolor=title_color,alpha=0.9))
+             f'{latest_m}\nScore={sc_now:.2f}',
+             fontsize=8,color=tc,va='center',
+             bbox=dict(boxstyle='round',facecolor='#1a1d27',edgecolor=tc,alpha=0.9))
     ax2.set_ylabel('Score',color='white',fontsize=9)
     ax2.set_ylim(-4,5); ax2.set_xticks(yt); ax2.set_xticklabels([])
     ax2.legend(fontsize=8,facecolor='#1a1d27',labelcolor='white',
-               loc='upper right',ncol=2)
+               loc='upper right',ncol=3)
 
-    # P3: Buffer / pos_area / 距离触发
-    buf_max=max((v for v in buf_p if not np.isnan(v)),default=10)
-    ax3.fill_between(xi,buf_p,0,alpha=0.18,color=GRN,zorder=2,
-                     label=f'Buffer={buf_now:.1f}（负面积）')
-    ax3.fill_between(xi,pa_p, 0,alpha=0.15,color=YEL,zorder=3,
-                     label=f'Pos area={pos_now:.1f}（正面积）')
-    ax3.plot(xi,eff_p,color=RED,lw=1.5,zorder=5,label='Effective（触发量）')
-    ax3.fill_between(xi,eff_p,0,where=[not np.isnan(e) and e>0 for e in eff_p],
-        alpha=0.35,color=RED,zorder=4)
-    ax3.axhline(0,color='white',lw=1,ls='--',alpha=0.5)
-    # 标注当前gap
-    ax3.annotate(
-        f'Gap={gap:.1f}\n≈{months_to_trigger}mo to trigger',
-        xy=(latest_i,pos_now),xytext=(latest_i-60,pos_now+15),
-        fontsize=8.5,color=YEL,fontweight='bold',
-        arrowprops=dict(arrowstyle='->',color=YEL,lw=0.9))
-    ax3.set_ylabel('Buffer / Pos Area',color='white',fontsize=9)
+    # P3: CR月度
+    ax3.plot(xi,cr_p,color=ORG,lw=1.5,zorder=5,label='Cumulative Risk (CR)')
+    ax3.fill_between(xi,cr_p,CR_THRESH,
+        where=[not np.isnan(c) and c>CR_THRESH for c in cr_p],
+        alpha=0.30,color=RED,zorder=4,label=f'CR>{CR_THRESH} → 1/3仓')
+    ax3.fill_between(xi,cr_p,0,
+        where=[not np.isnan(c) and 0<c<=CR_THRESH for c in cr_p],
+        alpha=0.12,color=YEL,zorder=3)
+    ax3.axhline(CR_THRESH,color=RED,lw=2.0,ls='--',alpha=0.9,
+                label=f'Threshold={CR_THRESH}')
+    ax3.axhline(0,color='white',lw=0.8,ls='--',alpha=0.4)
+    # 触发标注
+    prev=False
+    for i,ym in enumerate(months):
+        cr=cr_p[i]
+        if np.isnan(cr): prev=False; continue
+        if cr>CR_THRESH:
+            if not prev:
+                ax3.scatter(i,cr,color=RED,s=80,zorder=7)
+                ax3.annotate(ym,xy=(i,cr),xytext=(i+8,cr+1.5),
+                            fontsize=8,color=RED,fontweight='bold',
+                            arrowprops=dict(arrowstyle='->',color=RED,lw=0.8))
+            prev=True
+        elif prev:
+            ax3.scatter(i,0.1,color=GRN,s=70,zorder=7,marker='^')
+            prev=False
+    ax3.scatter(latest_i,cr_now,color=tc,s=150,zorder=8,marker='*')
+    ax3.text(latest_i+8,cr_now,
+             f'NOW\nCR={cr_now:.1f}\ngap={gap_to_trigger:.1f}',
+             fontsize=8,color=tc,va='center',
+             bbox=dict(boxstyle='round',facecolor='#1a1d27',edgecolor=tc,alpha=0.9))
+    cr_max=max((v for v in cr_p if not np.isnan(v)),default=CR_THRESH*2)
+    ax3.set_ylabel('Cumulative Risk (CR)',color='white',fontsize=9)
     ax3.set_xlabel('Year',color='white',fontsize=9)
-    ax3.set_ylim(-2,buf_max*1.12)
+    ax3.set_ylim(-0.5,cr_max*1.15)
     ax3.set_xticks(yt); ax3.set_xticklabels(yl,color='white',fontsize=8)
-    ax3.legend(fontsize=8,facecolor='#1a1d27',labelcolor='white',
-               loc='upper left',ncol=3)
+    ax3.legend(fontsize=8,facecolor='#1a1d27',labelcolor='white',loc='upper left')
 
     buf=io.BytesIO()
     plt.savefig(buf,format='png',dpi=130,bbox_inches='tight',facecolor=BG)
     buf.seek(0); img_data=buf.read(); plt.close()
 
-    # ── 发送邮件 ──────────────────────────────────────────
-    subject=(f"{status_icon} CC Market Indicator [{latest_m}]  "
-             f"Score={sc_now:.2f}  {status_text.split('—')[0].strip()}")
-
-    # 触发历史文本
-    trigger_lines="\n".join(
-        f"  {t[0]} {t[1]}: buf={t[2]:.1f}  pos={t[3]:.1f}"
-        for t in triggers) or "  （无触发记录）"
+    # ── 邮件 ──────────────────────────────────────────────
+    subject=(f"{status_icon} CC Market [{latest_m}]  "
+             f"CR={cr_now:.1f}/{CR_THRESH}  {status_text.split('—')[0].strip()}")
 
     body=f"""
-CC Market Indicator — Monthly Buffer Strategy
+CC Market Indicator — Monthly CR_reset Strategy
 报告日期：{today}  数据截至：{latest_m}
 {'='*55}
 
@@ -404,26 +397,25 @@ CC Market Indicator — Monthly Buffer Strategy
   z_CE            = {zce_now:.2f}
   Score           = {sc_now:.2f}
 
-【Buffer状态】
-  buffer (负面积) = {buf_now:.2f}
-  pos_area(正面积)= {pos_now:.2f}
-  gap（差距）     = {gap:.2f}
-  预计触发        ≈ {months_to_trigger} 个月后（按近24月Score均值估算）
+【CR状态】
+  Cumulative Risk = {cr_now:.2f}
+  触发阈值        = {CR_THRESH}
+  距触发差距      = {gap_to_trigger:.2f}
+  预计触发        ≈ {mo_to_trigger} 个月后
 
 【策略说明】
-  触发条件：pos_area > buffer
-  解除条件：连续 {CONFIRM} 个月 Score < 0
-  报警仓位：股票 1/3 + SGOV 2/3
-  正常仓位：股票 100%（VTI / SPY）
+  Score > 0 → CR累加
+  Score ≤ 0 → CR清零（立刻满仓）
+  CR > {CR_THRESH}  → 1/3仓 + 2/3 SGOV
+  CR ≤ {CR_THRESH}  → 100% 股票（VTI/SPY）
 
 【历史触发记录】
 {trigger_lines}
 
-【回测表现（1985-2025）】
-  CAGR   = 10.07%  vs  B&H 9.11%
-  超额   = +0.96%/yr
-  Sharpe = 0.201（月度，不可与年度Sharpe直接比较）
-  MaxDD  = -32.2%  vs  B&H -40.1%
+【回测表现（1985-2025，月度）】
+  CAGR   ≈ 9-10%  vs  B&H ≈ 9.1%
+  MaxDD  = -10% ~ -25%（取决于阈值）
+  当前阈值 = {CR_THRESH}（≈年度版3.0×3月）
 
 附件：完整指标图表
 """
@@ -432,7 +424,7 @@ CC Market Indicator — Monthly Buffer Strategy
     msg['From']=GMAIL_USER; msg['To']=NOTIFY_EMAIL
     msg['Subject']=subject
     msg.attach(MIMEText(body,'plain','utf-8'))
-    img=MIMEImage(img_data); img.add_header('Content-ID','<chart>')
+    img=MIMEImage(img_data)
     img.add_header('Content-Disposition','attachment',
                    filename=f'indicator_{latest_m}.png')
     msg.attach(img)
@@ -441,8 +433,7 @@ CC Market Indicator — Monthly Buffer Strategy
         server.login(GMAIL_USER,GMAIL_PASS)
         server.sendmail(GMAIL_USER,NOTIFY_EMAIL,msg.as_string())
 
-    print(f"\n邮件已发送至 {NOTIFY_EMAIL}")
-    print(f"主题：{subject}")
+    print(f"\n邮件已发送：{subject}")
 
 if __name__=="__main__":
     main()
