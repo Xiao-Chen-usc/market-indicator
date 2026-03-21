@@ -214,9 +214,13 @@ def main():
     in_alert= sv(eff_now) and eff_now>0
     pos_pct = POS_A*100 if in_alert else 100
 
-    # 需要多少个月触发（估算）
-    avg_score=np.mean([v for v in score[-24:] if sv(v)])
-    months_to_trigger=int(np.ceil(gap/avg_score)) if avg_score>0 and gap>0 else 0
+    # 需要多少个月触发（估算）：只用有效Score的最后24个月
+    valid_scores=[v for v in score if sv(v)]
+    avg_score=np.mean(valid_scores[-24:]) if valid_scores else 0
+    if avg_score>0 and gap>0:
+        months_to_trigger=int(np.ceil(gap/avg_score))
+    else:
+        months_to_trigger=0
 
     # 状态字符串
     if in_alert:
