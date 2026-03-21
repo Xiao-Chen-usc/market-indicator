@@ -1,3 +1,6 @@
+
+Copy
+
 """
 Quarterly email report with chart for CC's Market Indicator.
 Score = 0.5 * z(BI) + 0.5 * z(CreditExcess)
@@ -77,10 +80,22 @@ def build_history():
     gdp_real_d = fetch_fred("GDPC1",       "q")
     tcmdo_d    = fetch_fred("TCMDO",       "q")
  
+    # S&P 500 历史年均值（1970-2009硬编码，2010+从FRED拉）
+    sp_hist = {
+        1970:83,  1971:98,  1972:109, 1973:97,  1974:68,
+        1975:90,  1976:107, 1977:107, 1978:96,  1979:107,
+        1980:136, 1981:122, 1982:141, 1983:165, 1984:167,
+        1985:212, 1986:242, 1987:247, 1988:277, 1989:353,
+        1990:330, 1991:417, 1992:436, 1993:466, 1994:459,
+        1995:616, 1996:741, 1997:970, 1998:1229,1999:1469,
+        2000:1320,2001:1148,2002:880, 2003:1112,2004:1212,
+        2005:1248,2006:1418,2007:1468,2008:903, 2009:1115,
+    }
     try:
-        sp_d = fetch_fred("SP500", "a")
+        sp_fred = fetch_fred("SP500", "a")
+        sp_d = {**sp_hist, **sp_fred}   # FRED数据覆盖硬编码
     except Exception:
-        sp_d = {}
+        sp_d = sp_hist
  
     end_yr = datetime.date.today().year
     years  = list(range(1970, end_yr + 1))
