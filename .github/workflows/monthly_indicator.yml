@@ -21,7 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install numpy matplotlib
+        run: pip install numpy scipy matplotlib yfinance requests
 
       - name: Run indicator and send email
         env:
