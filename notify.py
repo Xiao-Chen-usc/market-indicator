@@ -1,6 +1,3 @@
-
-Copy
-
 """
 Quarterly email report with chart for CC's Market Indicator.
 Score = 0.5 * z(BI) + 0.5 * z(CreditExcess)
