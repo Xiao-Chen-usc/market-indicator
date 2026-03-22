@@ -70,7 +70,8 @@ def q_to_annual(q_dict, years):
     return {yr: q_dict.get(f"{yr}Q4") for yr in years}
 
 def pct_change(d, yr):
-    if yr not in d or (yr-1) not in d or not d[yr-1]: return None
+    if yr not in d or (yr-1) not in d: return None
+    if d[yr] is None or d[yr-1] is None or d[yr-1]==0: return None
     return (d[yr] - d[yr-1]) / d[yr-1] * 100
 
 def roll_mean(lst, w):
