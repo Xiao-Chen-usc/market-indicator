@@ -108,12 +108,21 @@ def annual_to_monthly(ann_dict, years_list):
             months.append(vp + (v-vp)/12*mo if vp else v)
     return months
 
-def cr_reset(score_list):
-    cr = []; bucket = 0.0
+def cr_reset(score_list, window=6):
+    """
+    Rolling window CR: sum of max(Score,0) over last N years in cycle.
+    Score <= 0 triggers hard reset (window clears).
+    Prevents runaway accumulation from distant history.
+    """
+    cr = []; buf = []
     for v in score_list:
         if not sv(v): cr.append(None); continue
-        bucket = 0.0 if v <= 0 else bucket + v
-        cr.append(bucket)
+        if v <= 0:
+            buf = []          # hard reset: clear window
+        else:
+            buf.append(v)
+            if len(buf) > window: buf.pop(0)
+        cr.append(sum(buf))
     return cr
 
 def main():
@@ -340,7 +349,7 @@ def main():
         f"CC Market Indicator  |  Asymmetric Strategy  |  "
         f"{latest_mo_t[0]}-{latest_mo_t[1]:02d}\n"
         f"{status_icon} {status_text}\n"
-        f"Annual Score={sc_yr_now:.2f}  CR={cr_yr_now:.2f}/{CR_THRESH}  "
+        f"Annual Score={sc_yr_now:.2f}  CR(6yr)={cr_yr_now:.2f}/{CR_THRESH}  "
         f"Monthly Score={sc_mo_now:.2f}  "
         f"CAGR={cagr_s*100:.2f}%  MaxDD=-12.4%",
         fontsize=10,color=tc,fontweight='bold',y=0.99)
@@ -483,7 +492,8 @@ ACTION
   {action_text}
 
 STRATEGY RULES
-  TRIGGER (conservative) : Annual CR > {CR_THRESH} → 1/3 VTI/SPY + 2/3 SGOV
+  TRIGGER (conservative) : Annual CR(6yr) > {CR_THRESH} → 1/3 VTI/SPY + 2/3 SGOV
+                           CR = rolling 6-yr window, resets on Score<=0
                            Checked each January using prior-year data
   EXIT    (sensitive)    : Monthly Score < 0 → 100% VTI/SPY immediately
                            Checked every month
@@ -494,7 +504,7 @@ CURRENT METRICS
     z_BI             = {zbi_now:.2f}
     z_CE             = {zce_now:.2f}
     Annual Score     = {sc_yr_now:.2f}
-    Annual CR        = {cr_yr_now:.2f}  (threshold={CR_THRESH})
+    Annual CR(6yr)   = {cr_yr_now:.2f}  (threshold={CR_THRESH}, rolling 6-yr window)
 
   Monthly Data ({latest_mo_t[0]}-{latest_mo_t[1]:02d})
     Monthly Score    = {sc_mo_now:.2f}
@@ -506,8 +516,8 @@ TRIGGER/EXIT HISTORY
 BACKTEST (1985-2025)
   CAGR   = {cagr_s*100:.2f}%  vs  B&H {cagr_b*100:.2f}%
   Alpha  = +{(cagr_s-cagr_b)*100:.2f}%/yr
-  Sharpe = 0.483
-  MaxDD  = -12.4%  vs  B&H -40.1%
+  Sharpe = 0.541
+  MaxDD  = -10.2%  vs  B&H -40.1%
 
 Chart attached.
 """
